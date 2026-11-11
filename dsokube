@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# =============================================================
+# dsokube — K3s on machines you already have, through the official k3s-ansible
+#   Inventory: a dsonode set name, or any Ansible inventory file (-i).
+#   Groups (k3s-ansible's own): k3s_cluster, server, agent.
+#
+# Needs  : bash, curl, jq, ansible-core 2.15+
+# Usage  : dsokube help
+#
+# One folder per cluster: ~/.config/dsokube/<cluster>/
+#   token        join token, made once (600)
+#   kubeconfig   context named after the cluster
+# Shared:  ~/.config/dsokube/collections   the pinned k3s-ansible
+# =============================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib/common.sh
+. "${SCRIPT_DIR}/lib/common.sh"
+# shellcheck source=lib/checks.sh
+. "${SCRIPT_DIR}/lib/checks.sh"
+
+DSOKUBE_HOME="${DSOKUBE_HOME:-$HOME/.config/dsokube}"
+export ANSIBLE_PYTHON_INTERPRETER="${ANSIBLE_PYTHON_INTERPRETER:-auto_silent}"
+NAME_RE='^[a-z][a-z0-9-]{0,15}$'
+
+usage() {
+  cat <<'EOF'
+Usage: dsokube <command> <cluster> [options]
+
+  up <cluster> [-i INVENTORY]   install or update K3s (runs again safely)
+  status <cluster>              nodes and pods
+  ctx <cluster>                 point ~/.kube/config at this cluster
+  down <cluster> [-y]           uninstall K3s from the nodes (machines stay)
+  help
+
+<cluster> is a dsonode set name: its inventory comes from `dsonode inventory <cluster>`.
+With -i, any inventory file works; <cluster> then only names the folder and context.
+EOF
+}
+
+# resolve <cluster> [-i inventory]  -> NAME, DIR, INV
+resolve() {
+  NAME="${1:-}"; shift || true
+  if [[ -z "$NAME" ]]; then
+    info "Clusters: $(find "$DSOKUBE_HOME" -mindepth 1 -maxdepth 1 -type d ! -name collections -printf "%f " 2>/dev/null)"
+    die "Usage: dsokube <command> <cluster> [-i INVENTORY] [-y]"
+  fi
+  [[ "$NAME" =~ $NAME_RE ]] || die "Cluster name: lowercase letters, digits and -, starting with a letter."
+  INV=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i) INV="${2:-}"; shift 2 ;;
+      -y) YES=1; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  if [[ -z "$INV" ]]; then
+    command -v dsonode >/dev/null || die "No -i INVENTORY, and dsonode is not installed."
+    INV="$(dsonode inventory "$NAME")" || die "dsonode has no built set '${NAME}'. Run: dsonode up ${NAME}"
+  fi
+  [[ -f "$INV" ]] || die "No inventory file ${INV}"
+  DIR="${DSOKUBE_HOME}/${NAME}"
+  install -d -m 700 "$DIR"
+}
+
+cmd_up() {
+  YES=0
+  resolve "$@"
+  load_versions
+  step "Checks"
+  need_ansible
+  check_inventory "$INV"
+  need_kubectl
+  need_collection
+  if [[ ! -s "${DIR}/token" ]]; then
+    ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${DIR}/token" )
+    log "Join token created: ${DIR}/token"
+  fi
+
+  step "K3s ${K3S_VERSION} on ${NAME} (k3s-ansible ${K3S_ANSIBLE_VERSION})"
+  ansible-playbook -i "$INV" k3s.orchestration.site \
+    -e "k3s_version=${K3S_VERSION}" \
+    -e "token=$(cat "${DIR}/token")" \
+    -e "api_endpoint=${API_ENDPOINT}" \
+    -e "kubeconfig=${DIR}/kubeconfig"
+
+  # k3s-ansible copies the kubeconfig back only when the server's copy changed.
+  # On a re-run (or after a manual run) it may not: fetch it ourselves.
+  if [[ ! -s "${DIR}/kubeconfig" ]]; then
+    ansible -i "$INV" 'server[0]' -b -m ansible.builtin.fetch \
+      -a "src=/etc/rancher/k3s/k3s.yaml dest=${DIR}/kubeconfig flat=yes" >/dev/null \
+      || die "Could not fetch the kubeconfig from the first server."
+  fi
+  chmod 600 "${DIR}/kubeconfig"
+  # Point it at the first server, and name the cluster, user and context after this cluster
+  sed -i -E \
+    -e "s#https://127\.0\.0\.1:6443#https://${API_ENDPOINT}:6443#" \
+    -e "s/^(\s*(- )?(name|cluster|user|current-context): )default$/\1${NAME}/" \
+    "${DIR}/kubeconfig"
+  echo
+  log "Cluster '${NAME}' is up. kubeconfig: ${DIR}/kubeconfig"
+  KUBECONFIG="${DIR}/kubeconfig" kubectl get nodes -o wide
+  info "Next: dsokube ctx ${NAME}   (then plain kubectl works)"
+}
+
+cmd_status() {
+  resolve "$@"
+  [[ -f "${DIR}/kubeconfig" ]] || die "No kubeconfig yet. Run: dsokube up ${NAME}"
+  KUBECONFIG="${DIR}/kubeconfig" kubectl get nodes -o wide
+  echo
+  KUBECONFIG="${DIR}/kubeconfig" kubectl get pods -A
+}
+
+cmd_ctx() {
+  resolve "$@"
+  [[ -f "${DIR}/kubeconfig" ]] || die "No kubeconfig yet. Run: dsokube up ${NAME}"
+  install -d -m 700 "$HOME/.kube"
+  if [[ -f "$HOME/.kube/config" && ! -L "$HOME/.kube/config" ]]; then
+    mv "$HOME/.kube/config" "$HOME/.kube/config.bak.$(date +%Y%m%d%H%M%S)"
+    warn "Moved your own ~/.kube/config aside (config.bak.*)"
+  fi
+  ln -sfn "${DIR}/kubeconfig" "$HOME/.kube/config"
+  log "Linked ~/.kube/config -> ${NAME}"
+  kubectl get nodes
+}
+
+cmd_down() {
+  YES=0
+  resolve "$@"
+  load_versions
+  need_ansible
+  need_collection
+  if [[ "$YES" -ne 1 ]]; then
+    read -rp "  Uninstall K3s from every node of '${NAME}'? Cluster data is lost. [y/N] " a
+    [[ "$a" == "y" || "$a" == "Y" ]] || { info "Nothing changed."; return 0; }
+  fi
+  ansible-playbook -i "$INV" k3s.orchestration.reset
+  if [[ -L "$HOME/.kube/config" && "$(readlink "$HOME/.kube/config")" == "${DIR}/kubeconfig" ]]; then
+    rm -f "$HOME/.kube/config"
+  fi
+  rm -f "${DIR}/kubeconfig" "${DIR}/token"
+  log "K3s removed from '${NAME}'. The machines are still there (dsonode down ${NAME} removes them)."
+}
+
+main() {
+  local cmd="${1:-help}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$cmd" in
+    up)     cmd_up "$@" ;;
+    status) cmd_status "$@" ;;
+    ctx)    cmd_ctx "$@" ;;
+    down)   cmd_down "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
