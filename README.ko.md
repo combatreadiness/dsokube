@@ -81,6 +81,16 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/combatreadiness/dsokube/
 
 `-i`가 없으면 inventory는 `dsonode inventory <cluster>`에서 가져옵니다. `-i`를 쓰면 `<cluster>`는 폴더와 컨텍스트 이름으로만 씁니다.
 
+K3s 설정을 바꾸려면 `~/.config/dsokube/<cluster>/vars.yml`에 k3s-ansible 변수를 그대로 적으면 됩니다. `up`할 때마다 이 파일을 넘기니, 다시 돌려도 설정이 유지됩니다. 예를 들어 Cilium 같은 CNI를 직접 깔려고 K3s 기본 네트워크를 끄려면:
+
+```yaml
+server_config_yaml: |
+  flannel-backend: none
+  disable-network-policy: true
+```
+
+이렇게 띄우면 CNI를 설치하기 전까지 노드는 `NotReady`로 남습니다.
+
 ## 버전
 
 [`versions.env`](versions.env):

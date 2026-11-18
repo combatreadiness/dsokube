@@ -81,6 +81,16 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/combatreadiness/dsokube/
 
 Without `-i`, the inventory comes from `dsonode inventory <cluster>`. With `-i`, `<cluster>` only names the folder and the context.
 
+To change how K3s is set up, put k3s-ansible's own variables in `~/.config/dsokube/<cluster>/vars.yml`. `up` passes the file every time, so the setting stays on later runs. For example, K3s without its built-in network, for a CNI like Cilium:
+
+```yaml
+server_config_yaml: |
+  flannel-backend: none
+  disable-network-policy: true
+```
+
+The nodes then stay `NotReady` until you install the CNI.
+
 ## Versions
 
 [`versions.env`](versions.env):

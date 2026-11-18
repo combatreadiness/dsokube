@@ -10,6 +10,7 @@
 # One folder per cluster: ~/.config/dsokube/<cluster>/
 #   token        join token, made once (600)
 #   kubeconfig   context named after the cluster
+#   vars.yml     optional, yours: extra k3s-ansible variables, passed on every up
 # Shared:  ~/.config/dsokube/collections   the pinned k3s-ansible
 # =============================================================
 set -euo pipefail
@@ -36,6 +37,9 @@ Usage: dsokube <command> <cluster> [options]
 
 <cluster> is a dsonode set name: its inventory comes from `dsonode inventory <cluster>`.
 With -i, any inventory file works; <cluster> then only names the folder and context.
+
+~/.config/dsokube/<cluster>/vars.yml, when it exists, goes to k3s-ansible on every up
+(its own variables: server_config_yaml, agent_config_yaml, extra_server_args, ...).
 EOF
 }
 
@@ -78,8 +82,16 @@ cmd_up() {
     log "Join token created: ${DIR}/token"
   fi
 
+  # The cluster's own variables go first, so the values dsokube sets below still win.
+  local extra=()
+  if [[ -f "${DIR}/vars.yml" ]]; then
+    extra=(-e "@${DIR}/vars.yml")
+    log "Extra variables: ${DIR}/vars.yml"
+  fi
+
   step "K3s ${K3S_VERSION} on ${NAME} (k3s-ansible ${K3S_ANSIBLE_VERSION})"
   ansible-playbook -i "$INV" k3s.orchestration.site \
+    ${extra[@]+"${extra[@]}"} \
     -e "k3s_version=${K3S_VERSION}" \
     -e "token=$(cat "${DIR}/token")" \
     -e "api_endpoint=${API_ENDPOINT}" \
